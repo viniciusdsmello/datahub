@@ -9,6 +9,7 @@ import psycopg2  # noqa: F401
 import pydantic
 import redshift_connector
 
+from datahub.configuration.pattern_utils import is_schema_allowed
 from datahub.emitter.mce_builder import (
     make_data_platform_urn,
     make_dataset_urn_with_platform_instance,
@@ -26,13 +27,9 @@ from datahub.ingestion.api.decorators import (
 )
 from datahub.ingestion.api.source import (
     CapabilityReport,
+    MetadataWorkUnitProcessor,
     TestableSource,
     TestConnectionReport,
-)
-from datahub.ingestion.api.source_helpers import (
-    auto_stale_entity_removal,
-    auto_status_aspect,
-    auto_workunit_reporter,
 )
 from datahub.ingestion.api.workunit import MetadataWorkUnit
 from datahub.ingestion.source.common.subtypes import (
@@ -67,9 +64,6 @@ from datahub.ingestion.source.sql.sql_utils import (
 from datahub.ingestion.source.state.profiling_state_handler import ProfilingHandler
 from datahub.ingestion.source.state.redundant_run_skip_handler import (
     RedundantRunSkipHandler,
-)
-from datahub.ingestion.source.state.sql_common_state import (
-    BaseSQLAlchemyCheckpointState,
 )
 from datahub.ingestion.source.state.stale_entity_removal_handler import (
     StaleEntityRemovalHandler,
@@ -114,7 +108,10 @@ logger: logging.Logger = logging.getLogger(__name__)
 @capability(SourceCapability.DATA_PROFILING, "Optionally enabled via configuration")
 @capability(SourceCapability.DESCRIPTIONS, "Enabled by default")
 @capability(SourceCapability.LINEAGE_COARSE, "Optionally enabled via configuration")
-@capability(SourceCapability.USAGE_STATS, "Optionally enabled via configuration")
+@capability(
+    SourceCapability.USAGE_STATS,
+    "Enabled by default, can be disabled via configuration `include_usage_statistics`",
+)
 @capability(SourceCapability.DELETION_DETECTION, "Enabled via stateful ingestion")
 class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
     """
@@ -294,14 +291,6 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
         self.config: RedshiftConfig = config
         self.report: RedshiftReport = RedshiftReport()
         self.platform = "redshift"
-        # Create and register the stateful ingestion use-case handler.
-        self.stale_entity_removal_handler = StaleEntityRemovalHandler(
-            source=self,
-            config=self.config,
-            state_type_class=BaseSQLAlchemyCheckpointState,
-            pipeline_name=self.ctx.pipeline_name,
-            run_id=self.ctx.run_id,
-        )
         self.domain_registry = None
         if self.config.domain:
             self.domain_registry = DomainRegistry(
@@ -352,15 +341,6 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
 
         return conn
 
-    def get_workunits(self) -> Iterable[MetadataWorkUnit]:
-        return auto_stale_entity_removal(
-            self.stale_entity_removal_handler,
-            auto_workunit_reporter(
-                self.report,
-                auto_status_aspect(self.get_workunits_internal()),
-            ),
-        )
-
     def gen_database_container(self, database: str) -> Iterable[MetadataWorkUnit]:
         database_container_key = gen_database_key(
             database=database,
@@ -374,6 +354,14 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
             database_container_key=database_container_key,
             sub_types=[DatasetContainerSubTypes.DATABASE],
         )
+
+    def get_workunit_processors(self) -> List[Optional[MetadataWorkUnitProcessor]]:
+        return [
+            *super().get_workunit_processors(),
+            StaleEntityRemovalHandler.create(
+                self, self.config, self.ctx
+            ).workunit_processor,
+        ]
 
     def get_workunits_internal(self) -> Iterable[Union[MetadataWorkUnit, SqlWorkUnit]]:
         connection = RedshiftSource.get_redshift_connection(self.config)
@@ -432,10 +420,17 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
         for schema in RedshiftDataDictionary.get_schemas(
             conn=connection, database=database
         ):
-            logger.info(f"Schema: {database}.{schema.name}")
-            if not self.config.schema_pattern.allowed(schema.name):
+            if not is_schema_allowed(
+                self.config.schema_pattern,
+                schema.name,
+                database,
+                self.config.match_fully_qualified_names,
+            ):
                 self.report.report_dropped(f"{database}.{schema.name}")
                 continue
+
+            logger.info(f"Processing schema: {database}.{schema.name}")
+
             self.db_schemas[database][schema.name] = schema
             yield from self.process_schema(connection, database, schema)
 
@@ -470,7 +465,6 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
                 domain_config=self.config.domain,
                 domain_registry=self.domain_registry,
                 sub_types=[DatasetSubTypes.SCHEMA],
-                report=self.report,
             )
 
             schema_columns: Dict[str, Dict[str, List[RedshiftColumn]]] = {}
@@ -479,11 +473,11 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
             )
 
             if self.config.include_tables:
-                logger.info("process tables")
-                if not self.db_tables[schema.database]:
-                    return
-
-                if schema.name in self.db_tables[schema.database]:
+                logger.info(f"Process tables in schema {database}.{schema.name}")
+                if (
+                    self.db_tables[schema.database]
+                    and schema.name in self.db_tables[schema.database]
+                ):
                     for table in self.db_tables[schema.database][schema.name]:
                         table.columns = schema_columns[schema.name].get(table.name, [])
                         yield from self._process_table(table, database=database)
@@ -493,10 +487,22 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
                             )
                             + 1
                         )
+                        logger.debug(
+                            f"Table processed: {schema.database}.{schema.name}.{table.name}"
+                        )
+                else:
+                    logger.info(
+                        f"No tables in cache for {schema.database}.{schema.name}, skipping"
+                    )
+            else:
+                logger.info("Table processing disabled, skipping")
 
             if self.config.include_views:
-                logger.info("process views")
-                if schema.name in self.db_views[schema.database]:
+                logger.info(f"Process views in schema {schema.database}.{schema.name}")
+                if (
+                    self.db_views[schema.database]
+                    and schema.name in self.db_views[schema.database]
+                ):
                     for view in self.db_views[schema.database][schema.name]:
                         view.columns = schema_columns[schema.name].get(view.name, [])
                         yield from self._process_view(
@@ -509,6 +515,15 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
                             )
                             + 1
                         )
+                        logger.debug(
+                            f"Table processed: {schema.database}.{schema.name}.{view.name}"
+                        )
+                else:
+                    logger.info(
+                        f"No views in cache for {schema.database}.{schema.name}, skipping"
+                    )
+            else:
+                logger.info("View processing disabled, skipping")
 
             self.report.metadata_extraction_sec[report_key] = round(
                 timer.elapsed_seconds(), 2
@@ -580,8 +595,7 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
             table=table,
             database=database,
             schema=table.schema,
-            sub_type=table.type,
-            tags_to_add=[],
+            sub_type=DatasetSubTypes.TABLE,
             custom_properties=custom_properties,
         )
 
@@ -597,16 +611,11 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
             database=get_db_name(self.config),
             schema=schema,
             sub_type=DatasetSubTypes.VIEW,
-            tags_to_add=[],
             custom_properties={},
         )
 
         datahub_dataset_name = f"{database}.{schema}.{view.name}"
-        dataset_urn = make_dataset_urn_with_platform_instance(
-            platform=self.platform,
-            name=datahub_dataset_name,
-            platform_instance=self.config.platform_instance,
-        )
+        dataset_urn = self.gen_dataset_urn(datahub_dataset_name)
         if view.ddl:
             view_properties_aspect = ViewProperties(
                 materialized=view.type == "VIEW_MATERIALIZED",
@@ -670,6 +679,14 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
             entityUrn=dataset_urn, aspect=schema_metadata
         ).as_workunit()
 
+    def gen_dataset_urn(self, datahub_dataset_name: str) -> str:
+        return make_dataset_urn_with_platform_instance(
+            platform=self.platform,
+            name=datahub_dataset_name,
+            platform_instance=self.config.platform_instance,
+            env=self.config.env,
+        )
+
     # TODO: Move to common
     def gen_dataset_workunits(
         self,
@@ -677,15 +694,10 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
         database: str,
         schema: str,
         sub_type: str,
-        tags_to_add: Optional[List[str]] = None,
         custom_properties: Optional[Dict[str, str]] = None,
     ) -> Iterable[MetadataWorkUnit]:
         datahub_dataset_name = f"{database}.{schema}.{table.name}"
-        dataset_urn = make_dataset_urn_with_platform_instance(
-            platform=self.platform,
-            name=datahub_dataset_name,
-            platform_instance=self.config.platform_instance,
-        )
+        dataset_urn = self.gen_dataset_urn(datahub_dataset_name)
 
         yield from self.gen_schema_metadata(
             dataset_urn, table, str(datahub_dataset_name)
@@ -727,7 +739,6 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
         yield from add_table_to_schema_container(
             dataset_urn,
             parent_container_key=schema_container_key,
-            report=self.report,
         )
         dpi_aspect = get_dataplatform_instance_aspect(
             dataset_urn=dataset_urn,
@@ -738,7 +749,7 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
             yield dpi_aspect
 
         subTypes = SubTypes(typeNames=[sub_type])
-        MetadataChangeProposalWrapper(
+        yield MetadataChangeProposalWrapper(
             entityUrn=dataset_urn, aspect=subTypes
         ).as_workunit()
 
@@ -748,27 +759,65 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
                 entity_urn=dataset_urn,
                 domain_registry=self.domain_registry,
                 domain_config=self.config.domain,
-                report=self.report,
             )
 
     def cache_tables_and_views(self, connection, database):
         tables, views = RedshiftDataDictionary.get_tables_and_views(conn=connection)
         for schema in tables:
-            if self.config.schema_pattern.allowed(f"{database}.{schema}"):
-                self.db_tables[database][schema] = []
-                for table in tables[schema]:
-                    if self.config.table_pattern.allowed(
-                        f"{database}.{schema}.{table.name}"
-                    ):
-                        self.db_tables[database][schema].append(table)
+            if not is_schema_allowed(
+                self.config.schema_pattern,
+                schema,
+                database,
+                self.config.match_fully_qualified_names,
+            ):
+                logger.debug(
+                    f"Not caching table for schema {database}.{schema} which is not allowed by schema_pattern"
+                )
+                continue
+
+            self.db_tables[database][schema] = []
+            for table in tables[schema]:
+                if self.config.table_pattern.allowed(
+                    f"{database}.{schema}.{table.name}"
+                ):
+                    self.db_tables[database][schema].append(table)
+                    self.report.table_cached[f"{database}.{schema}"] = (
+                        self.report.table_cached.get(f"{database}.{schema}", 0) + 1
+                    )
+                else:
+                    logger.debug(
+                        f"Table {database}.{schema}.{table.name} is filtered by table_pattern"
+                    )
+                    self.report.table_filtered[f"{database}.{schema}"] = (
+                        self.report.table_filtered.get(f"{database}.{schema}", 0) + 1
+                    )
+
         for schema in views:
-            if self.config.schema_pattern.allowed(f"{database}.{schema}"):
-                self.db_views[database][schema] = []
-                for view in views[schema]:
-                    if self.config.view_pattern.allowed(
-                        f"{database}.{schema}.{view.name}"
-                    ):
-                        self.db_views[database][schema].append(view)
+            if not is_schema_allowed(
+                self.config.schema_pattern,
+                schema,
+                database,
+                self.config.match_fully_qualified_names,
+            ):
+                logger.debug(
+                    f"Not caching views for schema {database}.{schema} which is not allowed by schema_pattern"
+                )
+                continue
+
+            self.db_views[database][schema] = []
+            for view in views[schema]:
+                if self.config.view_pattern.allowed(f"{database}.{schema}.{view.name}"):
+                    self.db_views[database][schema].append(view)
+                    self.report.view_cached[f"{database}.{schema}"] = (
+                        self.report.view_cached.get(f"{database}.{schema}", 0) + 1
+                    )
+                else:
+                    logger.debug(
+                        f"View {database}.{schema}.{view.name} is filtered by view_pattern"
+                    )
+                    self.report.view_filtered[f"{database}.{schema}"] = (
+                        self.report.view_filtered.get(f"{database}.{schema}", 0) + 1
+                    )
 
     def get_all_tables(
         self,
@@ -806,12 +855,12 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
             return
 
         with PerfTimer() as timer:
-            usage_extractor = RedshiftUsageExtractor(
+            yield from RedshiftUsageExtractor(
                 config=self.config,
                 connection=connection,
                 report=self.report,
-            )
-            yield from usage_extractor.generate_usage(all_tables=all_tables)
+                dataset_urn_builder=self.gen_dataset_urn,
+            ).get_usage_workunits(all_tables=all_tables)
 
             self.report.usage_extraction_sec[database] = round(
                 timer.elapsed_seconds(), 2
@@ -866,11 +915,7 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
                     )
                     continue
                 datahub_dataset_name = f"{database}.{schema}.{table.name}"
-                dataset_urn = make_dataset_urn_with_platform_instance(
-                    platform=self.platform,
-                    name=datahub_dataset_name,
-                    platform_instance=self.config.platform_instance,
-                )
+                dataset_urn = self.gen_dataset_urn(datahub_dataset_name)
 
                 lineage_info = self.lineage_extractor.get_lineage(
                     table,
@@ -885,12 +930,7 @@ class RedshiftSource(StatefulIngestionSourceBase, TestableSource):
         for schema in self.db_views[database]:
             for view in self.db_views[database][schema]:
                 datahub_dataset_name = f"{database}.{schema}.{view.name}"
-                dataset_urn = make_dataset_urn_with_platform_instance(
-                    self.platform,
-                    datahub_dataset_name,
-                    self.config.platform_instance,
-                    env=self.config.env,
-                )
+                dataset_urn = self.gen_dataset_urn(datahub_dataset_name)
                 lineage_info = self.lineage_extractor.get_lineage(
                     view,
                     dataset_urn,

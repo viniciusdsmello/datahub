@@ -16,13 +16,16 @@ else
             cyrus-sasl-devel \
             openldap-clients \
             sqlite-devel \
-            xz-devel
+            xz-devel \
+            libxml2-devel \
+            libxslt-devel
     else
         $sudo_cmd apt-get update && $sudo_cmd apt-get install -y \
             librdkafka-dev \
             python3-ldap \
             libldap2-dev \
             libsasl2-dev \
-            ldap-utils
+            ldap-utils \
+            libkrb5-dev
     fi
 fi

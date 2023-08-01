@@ -68,10 +68,19 @@ class BigQueryV2Report(ProfilingSqlReport):
     total_query_log_entries: int = 0
     num_read_events: int = 0
     num_query_events: int = 0
+    num_view_query_events: int = 0
+    num_view_query_events_failed_sql_parsing: int = 0
+    num_view_query_events_failed_table_identification: int = 0
     num_filtered_read_events: int = 0
     num_filtered_query_events: int = 0
     num_usage_query_hash_collisions: int = 0
     num_operational_stats_workunits_emitted: int = 0
+
+    num_view_definitions_parsed: int = 0
+    num_view_definitions_failed_parsing: int = 0
+    num_view_definitions_failed_column_parsing: int = 0
+    view_definitions_parsing_failures: LossyList[str] = field(default_factory=LossyList)
+
     read_reasons_stat: Counter[str] = dataclasses.field(
         default_factory=collections.Counter
     )
@@ -80,7 +89,7 @@ class BigQueryV2Report(ProfilingSqlReport):
     )
     usage_state_size: Optional[str] = None
     ingestion_stage: Optional[str] = None
-    ingestion_stage_durations: Dict[str, str] = field(default_factory=TopKDict)
+    ingestion_stage_durations: TopKDict[str, float] = field(default_factory=TopKDict)
 
     _timer: Optional[PerfTimer] = field(
         default=None, init=False, repr=False, compare=False
@@ -88,7 +97,7 @@ class BigQueryV2Report(ProfilingSqlReport):
 
     def set_ingestion_stage(self, project: str, stage: str) -> None:
         if self._timer:
-            elapsed = f"{self._timer.elapsed_seconds():.2f}"
+            elapsed = round(self._timer.elapsed_seconds(), 2)
             logger.info(
                 f"Time spent in stage <{self.ingestion_stage}>: {elapsed} seconds"
             )

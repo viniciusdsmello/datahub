@@ -185,9 +185,7 @@ class MetabaseSource(Source):
                 )
                 if dashboard_snapshot is not None:
                     mce = MetadataChangeEvent(proposedSnapshot=dashboard_snapshot)
-                    wu = MetadataWorkUnit(id=dashboard_snapshot.urn, mce=mce)
-                    self.report.report_workunit(wu)
-                    yield wu
+                    yield MetadataWorkUnit(id=dashboard_snapshot.urn, mce=mce)
 
         except HTTPError as http_error:
             self.report.report_failure(
@@ -304,9 +302,7 @@ class MetabaseSource(Source):
                 chart_snapshot = self.construct_card_from_api_data(card_info)
                 if chart_snapshot is not None:
                     mce = MetadataChangeEvent(proposedSnapshot=chart_snapshot)
-                    wu = MetadataWorkUnit(id=chart_snapshot.urn, mce=mce)
-                    self.report.report_workunit(wu)
-                    yield wu
+                    yield MetadataWorkUnit(id=chart_snapshot.urn, mce=mce)
 
         except HTTPError as http_error:
             self.report.report_failure(
@@ -614,7 +610,7 @@ class MetabaseSource(Source):
         config = MetabaseConfig.parse_obj(config_dict)
         return cls(ctx, config)
 
-    def get_workunits(self) -> Iterable[MetadataWorkUnit]:
+    def get_workunits_internal(self) -> Iterable[MetadataWorkUnit]:
         yield from self.emit_card_mces()
         yield from self.emit_dashboard_mces()
 

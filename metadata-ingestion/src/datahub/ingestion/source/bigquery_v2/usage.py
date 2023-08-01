@@ -29,6 +29,7 @@ from datahub.configuration.time_window_config import get_time_bucket
 from datahub.emitter.mce_builder import make_user_urn
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
 from datahub.ingestion.api.closeable import Closeable
+from datahub.ingestion.api.source_helpers import auto_empty_dataset_usage_statistics
 from datahub.ingestion.api.workunit import MetadataWorkUnit
 from datahub.ingestion.source.bigquery_v2.bigquery_audit import (
     BQ_AUDIT_V2,
@@ -36,6 +37,7 @@ from datahub.ingestion.source.bigquery_v2.bigquery_audit import (
     AuditEvent,
     AuditLogEntry,
     BigQueryAuditMetadata,
+    BigqueryTableIdentifier,
     BigQueryTableRef,
     QueryEvent,
     ReadEvent,
@@ -53,6 +55,7 @@ from datahub.ingestion.source.usage.usage_common import (
     make_usage_workunit,
 )
 from datahub.metadata.schema_classes import OperationClass, OperationTypeClass
+from datahub.utilities.bigquery_sql_parser import BigQuerySQLParser
 from datahub.utilities.file_backed_collections import ConnectionWrapper, FileBackedDict
 from datahub.utilities.perf_timer import PerfTimer
 
@@ -124,6 +127,8 @@ def bigquery_audit_metadata_query_template(
     else:
         from_table = f"`{dataset}.cloudaudit_googleapis_com_data_access`"
 
+    # Deduplicates insertId via QUALIFY, see:
+    # https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry, insertId field
     query = f"""
         SELECT
             timestamp,
@@ -142,7 +147,7 @@ def bigquery_audit_metadata_query_template(
         AND
         (
             (
-                JSON_EXTRACT_SCALAR(protopayload_auditlog.methodName) IN
+                protopayload_auditlog.methodName IN
                     (
                         "google.cloud.bigquery.v2.JobService.Query",
                         "google.cloud.bigquery.v2.JobService.InsertJob"
@@ -160,6 +165,7 @@ def bigquery_audit_metadata_query_template(
             OR
                 JSON_EXTRACT_SCALAR(protopayload_auditlog.metadataJson, "$.tableDataRead.reason") = "JOB"
         )
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY insertId, timestamp, logName) = 1
         {limit_text};
     """
 
@@ -184,6 +190,7 @@ class BigQueryUsageState(Closeable):
                     e.timestamp, config.bucket_duration
                 ),
                 "user": lambda e: e.actor_email,
+                "from_query": lambda e: int(e.from_query),
             },
             cache_max_size=config.file_backed_cache_size,
             # Evict entire cache to reduce db calls.
@@ -198,6 +205,7 @@ class BigQueryUsageState(Closeable):
             extra_columns={
                 "query": lambda e: e.query,
                 "is_read": lambda e: int(e.statementType in READ_STATEMENT_TYPES),
+                "on_view": lambda e: int(e.query_on_view),
             },
             cache_max_size=config.file_backed_cache_size,
             cache_eviction_batch_size=max(int(config.file_backed_cache_size * 0.9), 1),
@@ -328,6 +336,20 @@ class BigQueryUsageState(Closeable):
                 column_freq=json.loads(row["column_freq"] or "[]"),
             )
 
+    def delete_original_read_events_for_view_query_events(self) -> None:
+        self.read_events.sql_query(
+            """
+            DELETE FROM
+                read_events
+            WHERE
+                read_events.from_query = 0 AND
+                read_events.name in (
+                    SELECT q.key FROM query_events q WHERE q.on_view = 1
+                )
+        """,
+            refs=[self.query_events],
+        )
+
     def report_disk_usage(self, report: BigQueryV2Report) -> None:
         report.usage_state_size = str(
             {
@@ -342,7 +364,7 @@ class BigQueryUsageState(Closeable):
 class BigQueryUsageExtractor:
     """
     This plugin extracts the following:
-    * Statistics on queries issued and tables and columns accessed (excludes views)
+    * Statistics on queries issued and tables and columns accessed
     * Aggregation of these statistics into buckets, by day or hour granularity
 
     :::note
@@ -350,9 +372,15 @@ class BigQueryUsageExtractor:
     :::
     """
 
-    def __init__(self, config: BigQueryV2Config, report: BigQueryV2Report):
+    def __init__(
+        self,
+        config: BigQueryV2Config,
+        report: BigQueryV2Report,
+        dataset_urn_builder: Callable[[BigQueryTableRef], str],
+    ):
         self.config: BigQueryV2Config = config
         self.report: BigQueryV2Report = report
+        self.dataset_urn_builder = dataset_urn_builder
         # Replace hash of query with uuid if there are hash conflicts
         self.uuid_to_query: Dict[str, str] = {}
 
@@ -363,13 +391,13 @@ class BigQueryUsageExtractor:
             and self.config.table_pattern.allowed(table_ref.table_identifier.table)
         )
 
-    def run(
+    def get_usage_workunits(
         self, projects: Iterable[str], table_refs: Collection[str]
     ) -> Iterable[MetadataWorkUnit]:
         events = self._get_usage_events(projects)
-        yield from self._run(events, table_refs)
+        yield from self._get_workunits_internal(events, table_refs)
 
-    def _run(
+    def _get_workunits_internal(
         self, events: Iterable[AuditEvent], table_refs: Collection[str]
     ) -> Iterable[MetadataWorkUnit]:
         try:
@@ -383,11 +411,38 @@ class BigQueryUsageExtractor:
                         usage_state, table_refs
                     )
 
-                yield from self._generate_usage_workunits(usage_state)
+                yield from auto_empty_dataset_usage_statistics(
+                    self._generate_usage_workunits(usage_state),
+                    config=self.config,
+                    dataset_urns={
+                        self.dataset_urn_builder(BigQueryTableRef.from_string_name(ref))
+                        for ref in table_refs
+                    },
+                )
                 usage_state.report_disk_usage(self.report)
         except Exception as e:
             logger.error("Error processing usage", exc_info=True)
             self.report.report_warning("usage-ingestion", str(e))
+
+    def generate_read_events_from_query(
+        self, query_event_on_view: QueryEvent
+    ) -> Iterable[AuditEvent]:
+        try:
+            tables = self.get_tables_from_query(
+                query_event_on_view.project_id,
+                query_event_on_view.query,
+            )
+            assert tables is not None and len(tables) != 0
+            for table in tables:
+                yield AuditEvent.create(
+                    ReadEvent.from_query_event(table, query_event_on_view)
+                )
+        except Exception as ex:
+            logger.debug(
+                f"Generating read events failed for this query on view: {query_event_on_view.query}. "
+                f"Usage won't be added. The error was {ex}."
+            )
+            self.report.num_view_query_events_failed_sql_parsing += 1
 
     def _ingest_events(
         self,
@@ -397,8 +452,33 @@ class BigQueryUsageExtractor:
     ) -> None:
         """Read log and store events in usage_state."""
         num_aggregated = 0
+        num_generated = 0
         for audit_event in events:
             try:
+                # Note for View Usage:
+                # If Query Event references a view, bigquery audit logs do not contain Read Event for view
+                # in its audit logs, but only for it base tables. To extract usage for views, we parse the
+                # sql query to find bigquery tables and views read in the query and generate Read Events
+                # for them in our code (`from_query`=True). For such Query Events, we delete the original
+                # Read Events coming from Bigquery audit logs and keep only generated ones.
+
+                # Caveats of SQL parsing approach used here:
+                # 1. If query parsing fails, usage for such query is not considered/counted.
+                # 2. Due to limitations of query parsing, field level usage is not available.
+                # To limit the impact, we use query parsing only for those queries that reference at least
+                # one view. For all other queries, field level usage is available through bigquery audit logs.
+                if (
+                    audit_event.query_event
+                    and audit_event.query_event.query_on_view
+                    and not self.config.usage.apply_view_usage_to_tables
+                ):
+                    query_event = audit_event.query_event
+                    self.report.num_view_query_events += 1
+
+                    for new_event in self.generate_read_events_from_query(query_event):
+                        num_generated += self._store_usage_event(
+                            new_event, usage_state, table_refs
+                        )
                 num_aggregated += self._store_usage_event(
                     audit_event, usage_state, table_refs
                 )
@@ -408,6 +488,10 @@ class BigQueryUsageExtractor:
                 )
                 self._report_error("store-event", e)
         logger.info(f"Total number of events aggregated = {num_aggregated}.")
+
+        if self.report.num_view_query_events > 0:
+            logger.info(f"Total number of read events generated = {num_generated}.")
+            usage_state.delete_original_read_events_for_view_query_events()
 
     def _generate_operational_workunits(
         self, usage_state: BigQueryUsageState, table_refs: Collection[str]
@@ -456,9 +540,7 @@ class BigQueryUsageExtractor:
                     user_freq=entry.user_freq,
                     column_freq=entry.column_freq,
                     bucket_duration=self.config.bucket_duration,
-                    resource_urn_builder=lambda resource: resource.to_urn(
-                        self.config.env
-                    ),
+                    resource_urn_builder=self.dataset_urn_builder,
                     top_n_queries=self.config.usage.top_n_queries,
                     format_sql_queries=self.config.usage.format_sql_queries,
                 )
@@ -902,6 +984,56 @@ class BigQueryUsageExtractor:
                 self._report_error(
                     f"log-parse-{project_id}", e, group="usage-log-parse"
                 )
+
+    def get_tables_from_query(
+        self, default_project: str, query: str
+    ) -> Optional[List[BigQueryTableRef]]:
+        """
+        This method attempts to parse bigquery objects read in the query
+        """
+        if not query:
+            return None
+
+        parsed_tables = set()
+        try:
+            parser = BigQuerySQLParser(
+                query,
+                self.config.sql_parser_use_external_process,
+                use_raw_names=self.config.lineage_sql_parser_use_raw_names,
+            )
+            tables = parser.get_tables()
+        except Exception as ex:
+            logger.debug(
+                f"Sql parsing failed on this query on view: {query}. "
+                f"Usage won't be added. The error was {ex}."
+            )
+            return None
+
+        for table in tables:
+            parts = table.split(".")
+            if len(parts) == 2:
+                parsed_tables.add(
+                    BigQueryTableRef(
+                        BigqueryTableIdentifier(
+                            project_id=default_project, dataset=parts[0], table=parts[1]
+                        )
+                    ).get_sanitized_table_ref()
+                )
+            elif len(parts) == 3:
+                parsed_tables.add(
+                    BigQueryTableRef(
+                        BigqueryTableIdentifier(
+                            project_id=parts[0], dataset=parts[1], table=parts[2]
+                        )
+                    ).get_sanitized_table_ref()
+                )
+            else:
+                logger.debug(
+                    f"Invalid table identifier {table} when parsing query on view {query}"
+                )
+                self.report.num_view_query_events_failed_table_identification += 1
+
+        return list(parsed_tables)
 
     def _report_error(
         self, label: str, e: Exception, group: Optional[str] = None

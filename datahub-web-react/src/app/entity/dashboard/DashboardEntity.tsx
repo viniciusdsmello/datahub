@@ -9,7 +9,7 @@ import {
 import { Dashboard, EntityType, LineageDirection, OwnershipType, SearchResult } from '../../../types.generated';
 import { Entity, EntityCapabilityType, IconStyleType, PreviewType } from '../Entity';
 import { EntityProfile } from '../shared/containers/profile/EntityProfile';
-import { SidebarOwnerSection } from '../shared/containers/profile/sidebar/Ownership/SidebarOwnerSection';
+import { SidebarOwnerSection } from '../shared/containers/profile/sidebar/Ownership/sidebar/SidebarOwnerSection';
 import { SidebarAboutSection } from '../shared/containers/profile/sidebar/AboutSection/SidebarAboutSection';
 import { SidebarTagsSection } from '../shared/containers/profile/sidebar/SidebarTagsSection';
 import { DocumentationTab } from '../shared/tabs/Documentation/DocumentationTab';
@@ -29,6 +29,7 @@ import { EmbedTab } from '../shared/tabs/Embed/EmbedTab';
 import EmbeddedProfile from '../shared/embed/EmbeddedProfile';
 import DataProductSection from '../shared/containers/profile/sidebar/DataProduct/DataProductSection';
 import { getDataProduct } from '../shared/utils';
+import { LOOKER_URN } from '../../ingest/source/builder/constants';
 
 /**
  * Definition of the DataHub Dashboard entity.
@@ -113,8 +114,12 @@ export class DashboardEntity implements Entity<Dashboard> {
                     name: 'Preview',
                     component: EmbedTab,
                     display: {
-                        visible: (_, dashboard: GetDashboardQuery) => !!dashboard?.dashboard?.embed?.renderUrl,
-                        enabled: (_, dashboard: GetDashboardQuery) => !!dashboard?.dashboard?.embed?.renderUrl,
+                        visible: (_, dashboard: GetDashboardQuery) =>
+                            !!dashboard?.dashboard?.embed?.renderUrl &&
+                            dashboard?.dashboard?.platform.urn === LOOKER_URN,
+                        enabled: (_, dashboard: GetDashboardQuery) =>
+                            !!dashboard?.dashboard?.embed?.renderUrl &&
+                            dashboard?.dashboard?.platform.urn === LOOKER_URN,
                     },
                 },
                 {
@@ -134,16 +139,16 @@ export class DashboardEntity implements Entity<Dashboard> {
                     component: SidebarAboutSection,
                 },
                 {
+                    component: SidebarOwnerSection,
+                    properties: {
+                        defaultOwnerType: OwnershipType.TechnicalOwner,
+                    },
+                },
+                {
                     component: SidebarTagsSection,
                     properties: {
                         hasTags: true,
                         hasTerms: true,
-                    },
-                },
-                {
-                    component: SidebarOwnerSection,
-                    properties: {
-                        defaultOwnerType: OwnershipType.TechnicalOwner,
                     },
                 },
                 {

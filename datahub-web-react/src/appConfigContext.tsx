@@ -24,6 +24,9 @@ export const DEFAULT_APP_CONFIG = {
         queriesTab: {
             queriesTabResultSize: 5,
         },
+        entityProfile: {
+            domainDefaultTab: null,
+        },
     },
     authConfig: {
         tokenAuthEnabled: false,
@@ -36,6 +39,12 @@ export const DEFAULT_APP_CONFIG = {
     },
     viewsConfig: {
         enabled: false,
+    },
+    featureFlags: {
+        readOnlyModeEnabled: false,
+        showSearchFiltersV2: true,
+        showBrowseV2: true,
+        showAcrylInfo: false,
     },
 };
 

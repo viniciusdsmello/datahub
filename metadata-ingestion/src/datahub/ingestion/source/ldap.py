@@ -15,12 +15,8 @@ from datahub.ingestion.api.decorators import (
     platform_name,
     support_status,
 )
-from datahub.ingestion.api.source_helpers import (
-    auto_stale_entity_removal,
-    auto_status_aspect,
-)
+from datahub.ingestion.api.source import MetadataWorkUnitProcessor
 from datahub.ingestion.api.workunit import MetadataWorkUnit
-from datahub.ingestion.source.state.entity_removal_state import GenericCheckpointState
 from datahub.ingestion.source.state.stale_entity_removal_handler import (
     StaleEntityRemovalHandler,
     StaleEntityRemovalSourceReport,
@@ -132,6 +128,16 @@ class LDAPSourceConfig(StatefulIngestionConfigBase, DatasetSourceConfigMixin):
         default=20, description="Size of each page to fetch when extracting metadata."
     )
 
+    manager_filter_enabled: bool = Field(
+        default=True,
+        description="Use LDAP extractor filter to search managers.",
+    )
+
+    manager_pagination_enabled: bool = Field(
+        default=True,
+        description="Use pagination while search for managers (enabled by default).",
+    )
+
     # default mapping for attrs
     user_attrs_map: Dict[str, Any] = {}
     group_attrs_map: Dict[str, Any] = {}
@@ -188,14 +194,6 @@ class LDAPSource(StatefulIngestionSourceBase):
         super(LDAPSource, self).__init__(config, ctx)
         self.config = config
 
-        self.stale_entity_removal_handler = StaleEntityRemovalHandler(
-            source=self,
-            config=self.config,
-            state_type_class=GenericCheckpointState,
-            pipeline_name=self.ctx.pipeline_name,
-            run_id=self.ctx.run_id,
-        )
-
         # ensure prior defaults are in place
         for k in user_attrs_map:
             if k not in self.config.user_attrs_map:
@@ -228,11 +226,13 @@ class LDAPSource(StatefulIngestionSourceBase):
         config = LDAPSourceConfig.parse_obj(config_dict)
         return cls(ctx, config)
 
-    def get_workunits(self) -> Iterable[MetadataWorkUnit]:
-        return auto_stale_entity_removal(
-            self.stale_entity_removal_handler,
-            auto_status_aspect(self.get_workunits_internal()),
-        )
+    def get_workunit_processors(self) -> List[Optional[MetadataWorkUnitProcessor]]:
+        return [
+            *super().get_workunit_processors(),
+            StaleEntityRemovalHandler.create(
+                self, self.config, self.ctx
+            ).workunit_processor,
+        ]
 
     def get_workunits_internal(self) -> Iterable[MetadataWorkUnit]:
         """Returns an Iterable containing the workunits to ingest LDAP users or groups."""
@@ -296,11 +296,19 @@ class LDAPSource(StatefulIngestionSourceBase):
         if self.config.user_attrs_map["managerUrn"] in attrs:
             try:
                 m_cn = attrs[self.config.user_attrs_map["managerUrn"]][0].decode()
+                if self.config.manager_filter_enabled:
+                    manager_filter = self.config.filter
+                else:
+                    manager_filter = None
+                if self.config.manager_pagination_enabled:
+                    ctrls = [self.lc]
+                else:
+                    ctrls = None
                 manager_msgid = self.ldap_client.search_ext(
                     m_cn,
                     ldap.SCOPE_BASE,
-                    self.config.filter,
-                    serverctrls=[self.lc],
+                    manager_filter,
+                    serverctrls=ctrls,
                 )
                 result = self.ldap_client.result3(manager_msgid)
                 if result[1]:
@@ -310,9 +318,7 @@ class LDAPSource(StatefulIngestionSourceBase):
                 self.report.report_warning(dn, f"manager LDAP search failed: {e}")
         mce = self.build_corp_user_mce(dn, attrs, manager_ldap)
         if mce:
-            wu = MetadataWorkUnit(dn, mce)
-            self.report.report_workunit(wu)
-            yield wu
+            yield MetadataWorkUnit(dn, mce)
         else:
             self.report.report_dropped(dn)
 
@@ -323,9 +329,7 @@ class LDAPSource(StatefulIngestionSourceBase):
 
         mce = self.build_corp_group_mce(attrs)
         if mce:
-            wu = MetadataWorkUnit(dn, mce)
-            self.report.report_workunit(wu)
-            yield wu
+            yield MetadataWorkUnit(dn, mce)
         else:
             self.report.report_dropped(dn)
 

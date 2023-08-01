@@ -1,7 +1,6 @@
 import logging
 import os
 import time
-from datetime import datetime
 from typing import Dict, Iterable, List
 from urllib.parse import urlparse
 
@@ -159,7 +158,7 @@ class DeltaLakeSource(Source):
             reported_time: int = int(time.time() * 1000)
             last_updated_timestamp: int = hist["timestamp"]
             statement_type = OPERATION_STATEMENT_TYPES.get(
-                hist.get("operation"), OperationTypeClass.CUSTOM
+                hist.get("operation", "UNKNOWN"), OperationTypeClass.CUSTOM
             )
             custom_type = (
                 hist.get("operation")
@@ -186,16 +185,10 @@ class DeltaLakeSource(Source):
                 customProperties=operation_custom_properties,
             )
 
-            mcp = MetadataChangeProposalWrapper(
+            yield MetadataChangeProposalWrapper(
                 entityUrn=dataset_urn,
                 aspect=operation_aspect,
-            )
-            operational_wu = MetadataWorkUnit(
-                id=f"{datetime.fromtimestamp(last_updated_timestamp / 1000).isoformat()}-operation-aspect-{dataset_urn}",
-                mcp=mcp,
-            )
-            self.report.report_workunit(operational_wu)
-            yield operational_wu
+            ).as_workunit()
 
     def ingest_table(
         self, delta_table: DeltaTable, path: str
@@ -282,16 +275,11 @@ class DeltaLakeSource(Source):
             if s3_tags is not None:
                 dataset_snapshot.aspects.append(s3_tags)
         mce = MetadataChangeEvent(proposedSnapshot=dataset_snapshot)
-        wu = MetadataWorkUnit(id=delta_table.metadata().id, mce=mce)
-        self.report.report_workunit(wu)
-        yield wu
+        yield MetadataWorkUnit(id=str(delta_table.metadata().id), mce=mce)
 
-        container_wus = self.container_WU_creator.create_container_hierarchy(
+        yield from self.container_WU_creator.create_container_hierarchy(
             browse_path, dataset_urn
         )
-        for wu in container_wus:
-            self.report.report_workunit(wu)
-            yield wu
 
         yield from self._create_operation_aspect_wu(delta_table, dataset_urn)
 
@@ -351,7 +339,7 @@ class DeltaLakeSource(Source):
         for folder in os.listdir(path):
             yield os.path.join(path, folder)
 
-    def get_workunits(self) -> Iterable[MetadataWorkUnit]:
+    def get_workunits_internal(self) -> Iterable[MetadataWorkUnit]:
         self.container_WU_creator = ContainerWUCreator(
             self.source_config.platform,
             self.source_config.platform_instance,

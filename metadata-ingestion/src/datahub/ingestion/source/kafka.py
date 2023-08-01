@@ -35,15 +35,10 @@ from datahub.ingestion.api.decorators import (
     support_status,
 )
 from datahub.ingestion.api.registry import import_path
-from datahub.ingestion.api.source import SourceCapability
-from datahub.ingestion.api.source_helpers import (
-    auto_stale_entity_removal,
-    auto_status_aspect,
-)
+from datahub.ingestion.api.source import MetadataWorkUnitProcessor, SourceCapability
 from datahub.ingestion.api.workunit import MetadataWorkUnit
 from datahub.ingestion.source.common.subtypes import DatasetSubTypes
 from datahub.ingestion.source.kafka_schema_registry_base import KafkaSchemaRegistryBase
-from datahub.ingestion.source.state.entity_removal_state import GenericCheckpointState
 from datahub.ingestion.source.state.stale_entity_removal_handler import (
     StaleEntityRemovalHandler,
     StaleEntityRemovalSourceReport,
@@ -97,6 +92,10 @@ class KafkaSourceConfig(StatefulIngestionConfigBase, DatasetSourceConfigMixin):
     ignore_warnings_on_schema_type: bool = pydantic.Field(
         default=False,
         description="Disables warnings reported for non-AVRO/Protobuf value or key schemas if set.",
+    )
+    disable_topic_record_naming_strategy: bool = pydantic.Field(
+        default=False,
+        description="Disables the utilization of the TopicRecordNameStrategy for Schema Registry subjects. For more information, visit: https://docs.confluent.io/platform/current/schema-registry/serdes-develop/index.html#handling-differences-between-preregistered-and-client-derived-schemas:~:text=io.confluent.kafka.serializers.subject.TopicRecordNameStrategy",
     )
 
 
@@ -167,14 +166,6 @@ class KafkaSource(StatefulIngestionSourceBase):
                 cached_domains=[k for k in self.source_config.domain],
                 graph=self.ctx.graph,
             )
-        # Create and register the stateful ingestion use-case handlers.
-        self.stale_entity_removal_handler = StaleEntityRemovalHandler(
-            source=self,
-            config=self.source_config,
-            state_type_class=GenericCheckpointState,
-            pipeline_name=self.ctx.pipeline_name,
-            run_id=self.ctx.run_id,
-        )
 
     def init_kafka_admin_client(self) -> None:
         try:
@@ -198,11 +189,13 @@ class KafkaSource(StatefulIngestionSourceBase):
         config: KafkaSourceConfig = KafkaSourceConfig.parse_obj(config_dict)
         return cls(config, ctx)
 
-    def get_workunits(self) -> Iterable[MetadataWorkUnit]:
-        return auto_stale_entity_removal(
-            self.stale_entity_removal_handler,
-            auto_status_aspect(self.get_workunits_internal()),
-        )
+    def get_workunit_processors(self) -> List[Optional[MetadataWorkUnitProcessor]]:
+        return [
+            *super().get_workunit_processors(),
+            StaleEntityRemovalHandler.create(
+                self, self.source_config, self.ctx
+            ).workunit_processor,
+        ]
 
     def get_workunits_internal(self) -> Iterable[MetadataWorkUnit]:
         topics = self.consumer.list_topics(
@@ -213,7 +206,15 @@ class KafkaSource(StatefulIngestionSourceBase):
         for t, t_detail in topics.items():
             self.report.report_topic_scanned(t)
             if self.source_config.topic_patterns.allowed(t):
-                yield from self._extract_record(t, t_detail, extra_topic_details.get(t))
+                try:
+                    yield from self._extract_record(
+                        t, t_detail, extra_topic_details.get(t)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to extract topic {t}", exc_info=True)
+                    self.report.report_warning(
+                        "topic", f"Exception while extracting topic {t}: {e}"
+                    )
             else:
                 self.report.report_dropped(t)
 
@@ -270,9 +271,9 @@ class KafkaSource(StatefulIngestionSourceBase):
             # Point to note:
             # In Kafka documentSchema and keySchema both contains "doc" field.
             # DataHub Dataset "description" field is mapped to documentSchema's "doc" field.
-            description = json.loads(schema_metadata.platformSchema.documentSchema).get(
-                DOC_KEY
-            )
+            schema = json.loads(schema_metadata.platformSchema.documentSchema)
+            if isinstance(schema, dict):
+                description = schema.get(DOC_KEY)
 
         dataset_properties = DatasetPropertiesClass(
             name=topic, customProperties=custom_props, description=description
@@ -292,20 +293,13 @@ class KafkaSource(StatefulIngestionSourceBase):
 
         # 6. Emit the datasetSnapshot MCE
         mce = MetadataChangeEvent(proposedSnapshot=dataset_snapshot)
-        wu = MetadataWorkUnit(id=f"kafka-{topic}", mce=mce)
-        self.report.report_workunit(wu)
-        yield wu
+        yield MetadataWorkUnit(id=f"kafka-{topic}", mce=mce)
 
         # 7. Add the subtype aspect marking this as a "topic"
-        subtype_wu = MetadataWorkUnit(
-            id=f"{topic}-subtype",
-            mcp=MetadataChangeProposalWrapper(
-                entityUrn=dataset_urn,
-                aspect=SubTypesClass(typeNames=[DatasetSubTypes.TOPIC]),
-            ),
-        )
-        self.report.report_workunit(subtype_wu)
-        yield subtype_wu
+        yield MetadataChangeProposalWrapper(
+            entityUrn=dataset_urn,
+            aspect=SubTypesClass(typeNames=[DatasetSubTypes.TOPIC]),
+        ).as_workunit()
 
         domain_urn: Optional[str] = None
 
@@ -317,13 +311,10 @@ class KafkaSource(StatefulIngestionSourceBase):
                 )
 
         if domain_urn:
-            wus = add_domain_to_entity_wu(
+            yield from add_domain_to_entity_wu(
                 entity_urn=dataset_urn,
                 domain_urn=domain_urn,
             )
-            for wu in wus:
-                self.report.report_workunit(wu)
-                yield wu
 
     def build_custom_properties(
         self,
@@ -437,8 +428,6 @@ class KafkaSource(StatefulIngestionSourceBase):
         topic_configurations: dict,
     ) -> None:
         try:
-            assert config_result_future.done()
-            assert config_result_future.exception() is None
             topic_configurations[config_resource.name] = config_result_future.result()
         except Exception as e:
             logger.warning(
